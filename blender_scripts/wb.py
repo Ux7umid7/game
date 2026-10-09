@@ -305,6 +305,8 @@ def cut(obj, *cutters, keep_bevel=None):
         b = obj.modifiers.new("Cut", "BOOLEAN")
         b.operation = "DIFFERENCE"
         b.solver = "EXACT"
+        b.use_self = True            # walls touch/overlap at the corners
+        b.use_hole_tolerant = True
         b.object = c
     for c in cutters:
         c.modifiers.clear()
@@ -344,3 +346,167 @@ def place(root, loc, rot=(0, 0, 0), scale=1.0):
     root.location = loc
     root.rotation_euler = [math.radians(a) for a in rot]
     root.scale = (scale, scale, scale)
+
+
+# ---------------------------------------------------------------- multi-part mesh builder
+def rotm(rot):
+    """Euler XYZ in degrees -> 4x4 matrix (same order as Blender's XYZ euler)."""
+    return (Matrix.Rotation(math.radians(rot[2]), 4, "Z") @ Matrix.Rotation(math.radians(rot[1]), 4, "Y") @
+            Matrix.Rotation(math.radians(rot[0]), 4, "X"))
+
+
+def frame(origin, r, d):
+    """Local frame: u along r, v along d, w = outward normal (forced to point up). Returns (Matrix, r, d, n)."""
+    r, d = Vector(r).normalized(), Vector(d).normalized()
+    n = d.cross(r)
+    if n.z < 0:
+        r, n = -r, -n
+    o = Vector(origin)
+    M = Matrix(((r.x, d.x, n.x, o.x), (r.y, d.y, n.y, o.y), (r.z, d.z, n.z, o.z), (0, 0, 0, 1)))
+    return M, r, d, n
+
+
+class Builder:
+    """Accumulates many primitives (each with its own material) into ONE mesh object.
+
+    Coordinates are local to the current frame (push/pop a 4x4 matrix) — handy for walls and roof slopes.
+    Geometry is written directly (no bmesh operators), so cost stays linear even for 20k+ pieces.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.bm = bmesh.new()
+        self.mats = []
+        self.frames = [Matrix.Identity(4)]
+        self.polys = []  # (face, wanted normal) — single faces keep their authored side
+
+    # frames
+    def push(self, M):
+        self.frames.append(self.frames[-1] @ M)
+
+    def pop(self):
+        self.frames.pop()
+
+    def _mi(self, mat):
+        if mat is None:
+            return 0
+        if mat not in self.mats:
+            self.mats.append(mat)
+        return self.mats.index(mat)
+
+    def _mesh(self, coords, faces, mat, L=None):
+        T = self.frames[-1] @ L if L is not None else self.frames[-1]
+        vs = [self.bm.verts.new(T @ Vector(c)) for c in coords]
+        mi = self._mi(mat)
+        for f in faces:
+            try:
+                self.bm.faces.new([vs[i] for i in f]).material_index = mi
+            except ValueError:
+                pass
+        return vs
+
+    @staticmethod
+    def _shell(n, cap=True):
+        """Faces of a closed prism made of two rings of n verts (bottom 0..n-1, top n..2n-1)."""
+        faces = [(i, (i + 1) % n, n + (i + 1) % n, n + i) for i in range(n)]
+        if cap:
+            faces += [tuple(range(n))[::-1], tuple(range(n, 2 * n))]
+        return faces
+
+    # primitives
+    def box(self, c, s, mat, rot=None, L=None):
+        hx, hy, hz = s[0] / 2, s[1] / 2, s[2] / 2
+        co = [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+              (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)]
+        M = Matrix.Translation(c) @ (rotm(rot) if rot else Matrix.Identity(4))
+        return self._mesh(co, self._shell(4), mat, L @ M if L is not None else M)
+
+    def box2(self, p0, p1, mat, rot=None):
+        c = [(a + b) / 2 for a, b in zip(p0, p1)]
+        s = [max(abs(b - a), 1e-4) for a, b in zip(p0, p1)]
+        return self.box(c, s, mat, rot)
+
+    @staticmethod
+    def _plane_fn(plane, off):
+        if plane == "XZ":
+            return lambda u, v, t: (u, off + t, v)
+        if plane == "YZ":
+            return lambda u, v, t: (off + t, u, v)
+        return lambda u, v, t: (u, v, off + t)
+
+    def prism(self, pts, thick, mat, plane="XZ", off=0.0, L=None):
+        mk = self._plane_fn(plane, off)
+        co = [mk(u, v, -thick / 2) for u, v in pts] + [mk(u, v, thick / 2) for u, v in pts]
+        return self._mesh(co, self._shell(len(pts)), mat, L)
+
+    def poly(self, pts, mat, plane="XZ", off=0.0, L=None):
+        """Single flat polygon (double-sided in Blender and in glTF) — cheap leaves, petals, grass."""
+        # counter-clockwise points in (u, v) face: XZ -> -Y, YZ -> +X, XY -> +Z
+        mk = self._plane_fn(plane, off)
+        vs = self._mesh([mk(u, v, 0.0) for u, v in pts], [tuple(range(len(pts)))], mat, L)
+        if vs and vs[0].link_faces:
+            f = vs[0].link_faces[0]
+            f.normal_update()
+            self.polys.append((f, f.normal.copy()))
+        return vs
+
+    def slab(self, pts3d, thick, mat):
+        """Planar 3D polygon extruded along its normal by thick."""
+        P = [Vector(p) for p in pts3d]
+        n = (P[1] - P[0]).cross(P[2] - P[0]).normalized()
+        return self._mesh(P + [p + n * thick for p in P], self._shell(len(P)), mat)
+
+    def cyl(self, p0, p1, r, mat, verts=16, r2=None):
+        p0, p1 = Vector(p0), Vector(p1)
+        d = p1 - p0
+        h = d.length
+        r2 = r if r2 is None else r2
+        q = Vector((0, 0, 1)).rotation_difference(d.normalized())
+        M = Matrix.Translation(p0) @ q.to_matrix().to_4x4()
+        ring = [(math.cos(2 * math.pi * i / verts), math.sin(2 * math.pi * i / verts)) for i in range(verts)]
+        if r2 < 1e-6:  # cone
+            co = [(r * x, r * y, 0.0) for x, y in ring] + [(0.0, 0.0, h)]
+            faces = [tuple(range(verts))[::-1]] + [(i, (i + 1) % verts, verts) for i in range(verts)]
+            return self._mesh(co, faces, mat, M)
+        co = [(r * x, r * y, 0.0) for x, y in ring] + [(r2 * x, r2 * y, h) for x, y in ring]
+        return self._mesh(co, self._shell(verts), mat, M)
+
+    def lathe(self, prof, mat, origin=(0, 0, 0), axis=(1, 0, 0), segs=24):
+        t = bmesh.new()
+        vs = [t.verts.new((a, 0.0, r)) for a, r in prof]
+        es = [t.edges.new((vs[i], vs[i + 1])) for i in range(len(vs) - 1)]
+        bmesh.ops.spin(t, geom=vs + es, cent=(0, 0, 0), axis=(1, 0, 0), angle=2 * math.pi, steps=segs,
+                       use_merge=True)
+        bmesh.ops.remove_doubles(t, verts=t.verts, dist=1e-6)
+        q = Vector((1, 0, 0)).rotation_difference(Vector(axis).normalized())
+        T = self.frames[-1] @ Matrix.Translation(origin) @ q.to_matrix().to_4x4()
+        vmap = {v: self.bm.verts.new(T @ v.co) for v in t.verts}
+        mi = self._mi(mat)
+        for f in t.faces:
+            try:
+                self.bm.faces.new([vmap[v] for v in f.verts]).material_index = mi
+            except ValueError:
+                pass
+        t.free()
+
+    def empty(self):
+        return len(self.bm.verts) == 0
+
+    def finish(self, bevel=0.0, segs=1, angle=35, smooth=True, matrix=None, harden=True):
+        if self.empty():
+            self.bm.free()
+            return None
+        bmesh.ops.recalc_face_normals(self.bm, faces=self.bm.faces)
+        for f, n in self.polys:  # recalc picks a random side for open single faces; restore the authored one
+            f.normal_update()
+            if f.normal.dot(n) < 0:
+                f.normal_flip()
+        me = bpy.data.meshes.new(self.name)
+        self.bm.to_mesh(me)
+        self.bm.free()
+        o = bpy.data.objects.new(self.name, me)
+        for m in self.mats:
+            me.materials.append(m)
+        if matrix is not None:
+            o.matrix_basis = matrix
+        return _finish(o, None, bevel, segs, angle, smooth, harden)
